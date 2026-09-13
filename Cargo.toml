@@ -1,0 +1,40 @@
+[package]
+name = "tokio-sse-llm"
+version = "0.1.0"
+edition = "2021"
+authors = ["Biplab Das <biplab.k.das@gmail.com>"]
+description = "Zero-dependency SSE stream parser optimized for LLM token streaming (OpenAI, Anthropic, Ollama)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/biplabdas/tokio-sse-llm"
+documentation = "https://docs.rs/tokio-sse-llm"
+readme = "README.md"
+keywords = ["sse", "llm", "tokio", "openai", "streaming"]
+categories = ["asynchronous", "network-programming", "parsing", "command-line-utilities"]
+rust-version = "1.70"
+
+[[bin]]
+name = "sse"
+path = "src/bin/sse.rs"
+required-features = ["cli"]
+
+[dependencies]
+bytes = "1.5"
+futures-core = "0.3"
+
+# CLI dependencies (optional)
+tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
+futures-util = { version = "0.3", optional = true }
+reqwest = { version = "0.12", features = ["stream"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["stream"] }
+serde_json = "1"
+
+[features]
+default = []
+cli = ["dep:tokio", "dep:tokio-stream", "dep:futures-util", "dep:reqwest", "dep:serde_json"]
