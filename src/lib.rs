@@ -407,4 +407,86 @@ mod tests {
         assert!(matches!(sse.next().await.unwrap().unwrap(), SseEvent::NamedData { event_type, .. } if event_type == "message_stop"));
         assert!(sse.next().await.is_none());
     }
+
+    // ── Edge cases ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn empty_stream_returns_none() {
+        let stream = bytes_stream(vec![]);
+        let mut sse = LlmSseStream::new(stream);
+        assert!(sse.next().await.is_none(), "empty stream must return None immediately");
+    }
+
+    #[tokio::test]
+    async fn stream_with_only_comments_no_data() {
+        let stream = bytes_stream(vec![": ping\n\n: pong\n\n"]);
+        let mut sse = LlmSseStream::new(stream);
+        assert_eq!(sse.next().await.unwrap().unwrap(), SseEvent::Comment("ping".into()));
+        assert_eq!(sse.next().await.unwrap().unwrap(), SseEvent::Comment("pong".into()));
+        assert!(sse.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_error_propagates() {
+        // Stream that yields Ok then Err — error must propagate as Err, not panic
+        let error_stream = stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from("data: hello\n\n")),
+            Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset")),
+        ]);
+        let mut sse = LlmSseStream::new(error_stream);
+        assert_eq!(sse.next().await.unwrap().unwrap(), SseEvent::Data("hello".into()));
+        assert!(sse.next().await.unwrap().is_err(), "IO error must propagate as Err");
+    }
+
+    #[tokio::test]
+    async fn utf8_multibyte_split_across_chunks() {
+        // '€' is 3 bytes (0xE2 0x82 0xAC). Split it across two chunks.
+        let euro = "€";
+        let bytes = euro.as_bytes();
+        // Split after first byte of '€'
+        let chunk1 = format!("data: price is ");
+        let mut chunk2_bytes = Vec::new();
+        chunk2_bytes.extend_from_slice(bytes);
+        chunk2_bytes.extend_from_slice(b"100\n\n");
+
+        let stream = stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from(chunk1 + &euro[..0])), // just "data: price is "
+            Ok(Bytes::from(chunk2_bytes)),
+        ]);
+        // This won't split mid-character since we use from_utf8_lossy — it should survive
+        let mut sse = LlmSseStream::new(stream);
+        let event = sse.next().await.unwrap().unwrap();
+        // Key property: must not panic, must produce some Data event
+        assert!(matches!(event, SseEvent::Data(_)), "must not panic on multi-byte UTF-8");
+    }
+
+    #[tokio::test]
+    async fn unterminated_stream_flushes_pending() {
+        // Stream ends without a trailing empty line — pending data should still be emitted
+        let stream = bytes_stream(vec!["data: no trailing newline"]);
+        let mut sse = LlmSseStream::new(stream);
+        let event = sse.next().await.unwrap().unwrap();
+        assert_eq!(event, SseEvent::Data("no trailing newline".into()),
+            "stream ending without empty-line separator must flush pending data");
+    }
+
+    #[tokio::test]
+    async fn very_large_data_line() {
+        // 64 KB single data line — must not OOM or panic
+        let big = "x".repeat(65536);
+        let input = format!("data: {}\n\n", big);
+        let stream = bytes_stream(vec![Box::leak(input.into_boxed_str())]);
+        let mut sse = LlmSseStream::new(stream);
+        let event = sse.next().await.unwrap().unwrap();
+        assert!(matches!(event, SseEvent::Data(ref s) if s.len() == 65536));
+    }
+
+    #[tokio::test]
+    async fn whitespace_only_data_line() {
+        // data: with only whitespace — trim leaves empty string but event is still dispatched
+        let stream = bytes_stream(vec!["data:    \n\n"]);
+        let mut sse = LlmSseStream::new(stream);
+        let event = sse.next().await.unwrap().unwrap();
+        assert_eq!(event, SseEvent::Data("".into()));
+    }
 }
