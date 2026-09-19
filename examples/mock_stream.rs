@@ -35,6 +35,7 @@ async fn main() {
                 break;
             }
             SseEvent::Comment(c) => println!("  COMMENT: {c}"),
+            SseEvent::NamedData { event_type, data } => println!("  EVENT[{event_type}]: {data}"),
         }
     }
 }

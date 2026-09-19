@@ -48,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             SseEvent::Comment(_) => {}
+            SseEvent::NamedData { event_type, data } => println!("Event[{event_type}]: {data}"),
         }
     }
 
