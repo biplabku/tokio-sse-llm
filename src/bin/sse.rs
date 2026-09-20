@@ -148,6 +148,17 @@ where
                 }
                 break;
             }
+            SseEvent::NamedData { event_type, data } => {
+                // Named events (e.g. Anthropic's "content_block_delta") are
+                // treated the same as unnamed data events for text extraction.
+                if args.raw {
+                    println!("{data}");
+                } else if let Some(text) = extract_text(&data, args.extract) {
+                    print!("{text}");
+                } else if args.verbose {
+                    eprintln!("[{event_type}] {data}");
+                }
+            }
             SseEvent::Comment(c) => {
                 if args.verbose {
                     eprintln!("[comment] {c}");
