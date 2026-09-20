@@ -1,8 +1,10 @@
-//! Zero-dependency SSE stream parser optimized for LLM token streaming.
+//! SSE stream parser for LLM token streaming.
 //!
-//! Correctly implements the SSE dispatch algorithm:
+//! Wraps any `Stream<Item = Result<Bytes, E>>` from reqwest, hyper, or axum
+//! and emits structured [`SseEvent`] values. Correctly implements the SSE dispatch algorithm:
 //! - Multi-line `data:` fields are joined with `\n` into one event
 //! - `event:` field is captured and exposed via [`SseEvent::NamedData`]
+//! - `id:` field is tracked via [`LlmSseStream::last_event_id`] for reconnect support
 //! - Events are dispatched on the empty-line separator, not per line
 //!
 //! # Example
@@ -62,12 +64,18 @@ pub enum SseEvent {
 /// and emits structured [`SseEvent`] values following the SSE dispatch algorithm:
 /// events are assembled across multiple field lines and dispatched on the empty-line
 /// separator, not emitted line-by-line.
+///
+/// After consuming events, call [`last_event_id`](LlmSseStream::last_event_id) to
+/// retrieve the most recent `id:` field value. Pass this as the `Last-Event-ID`
+/// header when reconnecting to resume the stream from where it left off.
 pub struct LlmSseStream<S> {
     inner: S,
     buffer: BytesMut,
     // Accumulated fields for the current event block
     pending_data: Vec<String>,
     pending_event_type: Option<String>,
+    // Tracks the most recent id: field for reconnect support (Last-Event-ID header)
+    last_event_id: Option<String>,
 }
 
 impl<S> LlmSseStream<S> {
@@ -78,12 +86,39 @@ impl<S> LlmSseStream<S> {
             buffer: BytesMut::with_capacity(4096),
             pending_data: Vec::new(),
             pending_event_type: None,
+            last_event_id: None,
         }
     }
 
     /// Consume the parser and return the underlying stream.
     pub fn into_inner(self) -> S {
         self.inner
+    }
+
+    /// Returns the value of the most recent `id:` field received from the server.
+    ///
+    /// Per the SSE spec, clients should send this value as the `Last-Event-ID`
+    /// header when reconnecting, allowing the server to resume from where it left off.
+    /// Returns `None` if no `id:` field has been received yet, or if the server
+    /// sent an empty `id:` field to reset the ID.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use tokio_sse_llm::{LlmSseStream, LlmSseStreamExt};
+    /// # use tokio_stream::StreamExt;
+    /// # async fn reconnect_example() {
+    /// # let byte_stream = futures_util::stream::empty::<Result<bytes::Bytes, std::io::Error>>();
+    /// let mut stream = byte_stream.into_sse_stream();
+    /// while let Some(Ok(event)) = stream.next().await { /* handle events */ }
+    ///
+    /// // On disconnect, reconnect with the last received ID:
+    /// if let Some(id) = stream.last_event_id() {
+    ///     // send request with header: Last-Event-ID: {id}
+    /// }
+    /// # }
+    /// ```
+    pub fn last_event_id(&self) -> Option<&str> {
+        self.last_event_id.as_deref()
     }
 }
 
@@ -149,13 +184,21 @@ where
                     continue;
                 }
 
+                if let Some(id_bytes) = line.strip_prefix(b"id:") {
+                    // Per SSE spec: track the last event ID for reconnect support.
+                    // An empty id: field resets the ID to null.
+                    let id_value = String::from_utf8_lossy(id_bytes).trim().to_string();
+                    self.last_event_id = if id_value.is_empty() { None } else { Some(id_value) };
+                    continue;
+                }
+
                 if let Some(comment) = line.strip_prefix(b":") {
                     let text = String::from_utf8_lossy(comment).trim().to_string();
                     // Comments are emitted immediately; they don't affect pending state.
                     return Poll::Ready(Some(Ok(SseEvent::Comment(text))));
                 }
 
-                // id:, retry:, and unknown fields — ignore per spec.
+                // retry: and unknown fields — ignore per spec.
                 continue;
             }
 
@@ -355,12 +398,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn id_and_retry_fields_silently_ignored() {
-        // id: and retry: must not cause errors or extra events
+    async fn id_field_is_tracked_retry_is_ignored() {
+        // id: updates last_event_id; retry: is ignored; neither produces an extra event
         let stream = bytes_stream(vec!["id: 42\nretry: 3000\ndata: ok\n\n"]);
         let mut sse = LlmSseStream::new(stream);
         assert_eq!(sse.next().await.unwrap().unwrap(), SseEvent::Data("ok".into()));
+        assert_eq!(sse.last_event_id(), Some("42"), "id: field must be tracked for reconnect");
         assert!(sse.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn id_field_updates_across_events() {
+        // last_event_id advances as the stream progresses
+        let stream = bytes_stream(vec![
+            "id: 1\ndata: first\n\n",
+            "id: 2\ndata: second\n\n",
+        ]);
+        let mut sse = LlmSseStream::new(stream);
+        assert_eq!(sse.next().await.unwrap().unwrap(), SseEvent::Data("first".into()));
+        assert_eq!(sse.last_event_id(), Some("1"));
+        assert_eq!(sse.next().await.unwrap().unwrap(), SseEvent::Data("second".into()));
+        assert_eq!(sse.last_event_id(), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn empty_id_field_resets_to_none() {
+        // Per SSE spec: bare "id:" (no value) clears the last event ID
+        let stream = bytes_stream(vec!["id: 5\ndata: first\n\nid:\ndata: second\n\n"]);
+        let mut sse = LlmSseStream::new(stream);
+        sse.next().await.unwrap().unwrap();
+        assert_eq!(sse.last_event_id(), Some("5"));
+        sse.next().await.unwrap().unwrap();
+        assert_eq!(sse.last_event_id(), None, "empty id: must reset last_event_id to None");
+    }
+
+    #[tokio::test]
+    async fn no_id_field_means_none() {
+        // Stream with no id: field — last_event_id stays None
+        let stream = bytes_stream(vec!["data: hello\n\n"]);
+        let mut sse = LlmSseStream::new(stream);
+        sse.next().await.unwrap().unwrap();
+        assert_eq!(sse.last_event_id(), None);
     }
 
     #[tokio::test]
@@ -440,24 +518,24 @@ mod tests {
 
     #[tokio::test]
     async fn utf8_multibyte_split_across_chunks() {
-        // '€' is 3 bytes (0xE2 0x82 0xAC). Split it across two chunks.
+        // '€' is 3 bytes (0xE2 0x82 0xAC). The character is split across two TCP chunks,
+        // but the parser is safe: bytes accumulate in the buffer until a complete '\n'-
+        // terminated line is found. from_utf8_lossy is only called on complete line bytes,
+        // so the multi-byte character is always fully assembled before conversion.
         let euro = "€";
-        let bytes = euro.as_bytes();
-        // Split after first byte of '€'
-        let chunk1 = format!("data: price is ");
+        let chunk1 = "data: price is ".to_string();
         let mut chunk2_bytes = Vec::new();
-        chunk2_bytes.extend_from_slice(bytes);
+        chunk2_bytes.extend_from_slice(euro.as_bytes());
         chunk2_bytes.extend_from_slice(b"100\n\n");
 
         let stream = stream::iter(vec![
-            Ok::<Bytes, std::io::Error>(Bytes::from(chunk1 + &euro[..0])), // just "data: price is "
+            Ok::<Bytes, std::io::Error>(Bytes::from(chunk1)),
             Ok(Bytes::from(chunk2_bytes)),
         ]);
-        // This won't split mid-character since we use from_utf8_lossy — it should survive
         let mut sse = LlmSseStream::new(stream);
         let event = sse.next().await.unwrap().unwrap();
-        // Key property: must not panic, must produce some Data event
-        assert!(matches!(event, SseEvent::Data(_)), "must not panic on multi-byte UTF-8");
+        assert_eq!(event, SseEvent::Data("price is €100".into()),
+            "multi-byte character split across chunks must be assembled correctly");
     }
 
     #[tokio::test]

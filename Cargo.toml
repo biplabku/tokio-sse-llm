@@ -1,9 +1,9 @@
 [package]
 name = "tokio-sse-llm"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["Biplab Das <dasbiplabtu@gmail.com>"]
-description = "Zero-dependency SSE stream parser optimized for LLM token streaming (OpenAI, Anthropic, Ollama)"
+description = "Minimal-dependency SSE stream parser for LLM token streaming — wraps any byte stream from reqwest, hyper, or axum and emits structured SSE events (OpenAI, Anthropic, Ollama)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/biplabku/tokio-sse-llm"
 documentation = "https://docs.rs/tokio-sse-llm"
